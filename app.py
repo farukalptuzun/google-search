@@ -779,6 +779,11 @@ LEGACY_TEXT_SEARCH_URL = "https://maps.googleapis.com/maps/api/place/textsearch/
 LEGACY_PLACE_DETAILS_URL = "https://maps.googleapis.com/maps/api/place/details/json"
 DEFAULT_GOOGLE_REFERER = "http://localhost:8501"
 APIFY_ACTOR_ID = "compass/crawler-google-places"
+APIFY_ENRICHMENT_INPUT = {
+    "scrapePlaceDetailPage": True,
+    "scrapeContacts": True,
+    "includeWebResults": True,
+}
 MAX_SEARCH_PAGES = 2
 REQUEST_DELAY_SEC = 0.35
 PAGE_TOKEN_DELAY_SEC = 2.0
@@ -808,27 +813,21 @@ def normalize_name(name: str) -> str:
 
 def deduplicate_leads(leads: list[dict[str, str]]) -> list[dict[str, str]]:
     """
-    Aynı telefon veya firma adına sahip kayıtları temizler.
-    Birincil anahtar: normalize telefon; ikincil: normalize firma adı.
+    Aynı telefon numarasına sahip kayıtları temizler.
+    Farklı numaralı şubeler korunur; yalnızca birebir aynı numara elenir.
     """
     seen_phones: set[str] = set()
-    seen_names: set[str] = set()
     unique: list[dict[str, str]] = []
 
     for lead in leads:
         phone_key = normalize_phone(lead.get(COLUMN_TELEFON, ""))
-        name_key = normalize_name(lead.get(COLUMN_FIRMA, ""))
 
         if not phone_key:
             continue
         if phone_key in seen_phones:
             continue
-        if name_key and name_key in seen_names:
-            continue
 
         seen_phones.add(phone_key)
-        if name_key:
-            seen_names.add(name_key)
         unique.append(lead)
 
     return unique
@@ -1214,10 +1213,89 @@ def search_google_places(
     return leads
 
 
-def search_apify(query: str, api_token: str, max_places: int = 20) -> list[dict[str, str]]:
+def _first_text_value(*values: object) -> str:
+    """Birden fazla kaynaktan ilk geçerli metin değerini döndürür."""
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _first_phone_value(*values: object) -> str:
+    """Birden fazla kaynaktan ilk geçerli telefon değerini döndürür."""
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, str) and item.strip():
+                    return item.strip()
+    return ""
+
+
+def extract_phone_from_apify_item(item: dict) -> str:
     """
-    Apify Google Maps Scraper (compass/crawler-google-places) ile arama yapar.
-    apify-client yüklü değilse kullanıcıya bilgi verir.
+    Apify place kaydından telefon çıkarır.
+    Öncelik: Google Maps telefonu → website enrichment → contacts alt alanları.
+    """
+    maps_phone = _first_phone_value(
+        item.get("phoneUnformatted"),
+        item.get("phone"),
+        item.get("nationalPhoneNumber"),
+        item.get("internationalPhoneNumber"),
+        item.get("primaryPhoneUnformatted"),
+        item.get("primaryPhone"),
+    )
+    if maps_phone:
+        return maps_phone
+
+    phones_from_website = item.get("phonesFromWebsite")
+    if isinstance(phones_from_website, str) and phones_from_website.strip():
+        return phones_from_website.split(",")[0].strip()
+
+    phones_field = item.get("phones")
+    if isinstance(phones_field, list) and phones_field:
+        return str(phones_field[0]).strip()
+    if isinstance(phones_field, str) and phones_field.strip():
+        return phones_field.split(",")[0].strip()
+
+    contacts = item.get("contacts")
+    if isinstance(contacts, dict):
+        contact_phone = _first_phone_value(
+            contacts.get("phones"),
+            contacts.get("uncertainPhones"),
+            contacts.get("phone"),
+        )
+        if contact_phone:
+            return contact_phone
+
+    return ""
+
+
+def extract_firma_from_apify_item(item: dict) -> str:
+    """Apify place kaydından firma adını çıkarır."""
+    display_name = item.get("displayName")
+    if isinstance(display_name, dict):
+        return (display_name.get("text") or "").strip()
+    return _first_text_value(
+        item.get("title"),
+        item.get("name"),
+        str(display_name) if display_name else "",
+    )
+
+
+def search_apify(
+    sehir: str,
+    ilce: str,
+    anahtar_kelime: str,
+    api_token: str,
+    max_results: int | None = None,
+) -> list[dict[str, str]]:
+    """
+    Apify Google Maps Scraper ile ilçe bazlı tam kapsamlı arama yapar.
+    Konum ayrı alanlarda (city/state/countryCode); anahtar kelime searchStringsArray'de.
+    Detay sayfası + website contacts enrichment aktiftir.
+    max_results None ise Apify o ilçedeki tüm firmaları tarar.
     """
     try:
         from apify_client import ApifyClient
@@ -1226,25 +1304,34 @@ def search_apify(query: str, api_token: str, max_places: int = 20) -> list[dict[
         return []
 
     results: list[dict[str, str]] = []
+    label = f"{anahtar_kelime} | {ilce}, {sehir}"
 
     try:
         client = ApifyClient(api_token)
-        run_input = {
-            "searchStringsArray": [query],
-            "maxCrawledPlacesPerSearch": max_places,
-            "language": "tr",
+        run_input: dict = {
+            "searchStringsArray": [anahtar_kelime],
+            "city": ilce,
+            "state": sehir,
             "countryCode": "tr",
+            "language": "tr",
+            "skipClosedPlaces": False,
+            "searchMatching": "all",
+            **APIFY_ENRICHMENT_INPUT,
         }
+        if max_results is not None:
+            run_input["maxCrawledPlacesPerSearch"] = max_results
+
         run = client.actor(APIFY_ACTOR_ID).call(run_input=run_input)
 
         for item in client.dataset(run["defaultDatasetId"]).iterate_items():
-            name = item.get("title") or item.get("name") or ""
-            phone = item.get("phone") or item.get("phoneUnformatted") or ""
+            name = extract_firma_from_apify_item(item)
+            phone = extract_phone_from_apify_item(item)
+
             if name and phone:
-                results.append({COLUMN_FIRMA: name.strip(), COLUMN_TELEFON: phone.strip()})
+                results.append({COLUMN_FIRMA: name, COLUMN_TELEFON: phone})
 
     except Exception as exc:
-        st.warning(f"Apify hatası ('{query}'): {exc}")
+        st.warning(f"Apify hatası ('{label}'): {exc}")
 
     return results
 
@@ -1253,7 +1340,7 @@ def scrape_city(
     sehir: str,
     anahtar_kelime: str,
     ilceler: list[str],
-    search_fn: Callable[[str], list[dict[str, str]]],
+    search_fn: Callable[[str, str, str], list[dict[str, str]]],
     progress_bar,
     status_text,
 ) -> pd.DataFrame:
@@ -1262,7 +1349,7 @@ def scrape_city(
     total = len(ilceler)
 
     for index, ilce in enumerate(ilceler):
-        query = f"{sehir} {ilce} {anahtar_kelime}"
+        query_preview = f'"{anahtar_kelime}" → {ilce}, {sehir}'
         pct = int(((index + 1) / total) * 100)
         status_text.markdown(
             f"""
@@ -1272,7 +1359,7 @@ def scrape_city(
                 <div class="scan-status-meta">
                     {index + 1} / {total} ilçe &nbsp;·&nbsp; %{pct} tamamlandı
                 </div>
-                <div class="scan-query">"{query}"</div>
+                <div class="scan-query">{query_preview}</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1280,7 +1367,7 @@ def scrape_city(
         progress_bar.progress((index + 1) / total, text=f"{ilce} taranıyor... ({index + 1}/{total})")
 
         try:
-            district_leads = search_fn(query)
+            district_leads = search_fn(sehir, ilce, anahtar_kelime)
             all_leads.extend(district_leads)
         except Exception as exc:
             st.warning(f"{ilce} ilçesi atlandı: {exc}")
@@ -1692,6 +1779,13 @@ GOOGLE_REFERER = "http://localhost:8501"
 ```toml
 APIFY_API_TOKEN = "apify_api_..."
 ```
+
+**Otomatik aktif add-on'lar:**
+- `scrapePlaceDetailPage` — detay sayfası
+- `scrapeContacts` — website'den iletişim
+- `includeWebResults` — web sonuçları
+
+Telefon önceliği: Maps → `phonesFromWebsite` → `phones` → `contacts.phones`
                 """
             )
         with tab3:
@@ -1720,8 +1814,10 @@ MONGO_DB = "lead_scraper"
             )
 
 
-def render_sidebar() -> tuple[str, str, str, str, str, bool]:
+def render_sidebar() -> tuple[str, str, str, str, str, bool, int | None]:
     """Sidebar API ve MongoDB ayarlarını render eder."""
+    apify_max_results: int | None = None
+
     with st.sidebar:
         st.markdown("### Ayarlar")
         st.caption("Veri kaynağı ve API kimlik bilgileri")
@@ -1741,8 +1837,20 @@ def render_sidebar() -> tuple[str, str, str, str, str, bool]:
             api_key_label = "API Anahtarı"
         else:
             st.markdown("**Apify Google Maps**")
-            st.caption("compass/crawler-google-places actor'ü kullanılır.")
+            st.caption(
+                "Detay sayfası + website contacts enrichment aktif. "
+                "Telefon Maps'te yoksa website'den aranır."
+            )
             api_key_label = "API Token"
+
+            apify_limit_choice = st.selectbox(
+                "İlçe başına sonuç",
+                options=["Tümü (sınırsız)", "50", "100", "200"],
+                index=0,
+                help="Sınırsız: Apify o ilçedeki tüm firmaları tarar. Daha uzun sürer ve daha maliyetlidir.",
+            )
+            apify_max_results = None if apify_limit_choice == "Tümü (sınırsız)" else int(apify_limit_choice)
+            st.caption("Apify firma başına ücretlendirir. Sınırsız tarama en kapsamlı sonucu verir.")
 
         sidebar_api_key = st.text_input(
             api_key_label,
@@ -1781,7 +1889,7 @@ def render_sidebar() -> tuple[str, str, str, str, str, bool]:
             unsafe_allow_html=True,
         )
 
-    return provider, sidebar_api_key, google_referer, mongo_uri, mongo_db, mongo_enabled
+    return provider, sidebar_api_key, google_referer, mongo_uri, mongo_db, mongo_enabled, apify_max_results
 
 
 def main() -> None:
@@ -1795,7 +1903,7 @@ def main() -> None:
     inject_custom_css()
     render_header()
 
-    provider, sidebar_api_key, sidebar_referer, mongo_uri_input, mongo_db_input, mongo_enabled = render_sidebar()
+    provider, sidebar_api_key, sidebar_referer, mongo_uri_input, mongo_db_input, mongo_enabled, apify_max_results = render_sidebar()
 
     sehirler = sorted(TURKIYE_IL_ILCE.keys())
     mongo_uri, mongo_db = get_mongo_settings(mongo_uri_input, mongo_db_input)
@@ -1882,11 +1990,17 @@ def main() -> None:
             if provider == "Google Places API":
                 referer = get_google_referer(sidebar_referer)
                 place_cache = st.session_state.place_cache
-                search_fn: Callable[[str], list[dict[str, str]]] = (
-                    lambda q, k=api_key, r=referer, c=place_cache: search_google_places(q, k, r, c)
-                )
+
+                def search_fn_google(s: str, i: str, k: str) -> list[dict[str, str]]:
+                    query = f"{s} {i} {k}"
+                    return search_google_places(query, api_key, referer, place_cache)
+
+                search_fn: Callable[[str, str, str], list[dict[str, str]]] = search_fn_google
             else:
-                search_fn = lambda q: search_apify(q, api_key)
+                def search_fn_apify(s: str, i: str, k: str) -> list[dict[str, str]]:
+                    return search_apify(s, i, k, api_key, apify_max_results)
+
+                search_fn = search_fn_apify
 
             progress_bar.progress(0, text="Tarama başlıyor...")
             with st.spinner("İlçeler taranıyor, lütfen bekleyin..."):
